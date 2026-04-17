@@ -1,8 +1,7 @@
 {
   "name": "zynthari-gallery",
   "version": "1.0.0",
-  "description": "Zynthari Gallery - Fine Art Marketplace",
   "dependencies": {
-    "node-fetch": "^2.6.9"
+    "node-fetch": "2.6.9"
   }
 }
