@@ -1,10 +1,49 @@
 [build]
   publish = "public"
   functions = "netlify/functions"
+  command = "npm install"
+
+[functions]
+  node_bundler = "zisi"
 
 [[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  from = "/api/login"
+  to = "/.netlify/functions/login"
+  status = 200
+
+[[redirects]]
+  from = "/api/register"
+  to = "/.netlify/functions/register"
+  status = 200
+
+[[redirects]]
+  from = "/api/session"
+  to = "/.netlify/functions/session"
+  status = 200
+
+[[redirects]]
+  from = "/api/artworks"
+  to = "/.netlify/functions/artworks"
+  status = 200
+
+[[redirects]]
+  from = "/api/artwork-delete"
+  to = "/.netlify/functions/artwork-delete"
+  status = 200
+
+[[redirects]]
+  from = "/api/purchase"
+  to = "/.netlify/functions/purchase"
+  status = 200
+
+[[redirects]]
+  from = "/api/dashboard"
+  to = "/.netlify/functions/dashboard"
+  status = 200
+
+[[redirects]]
+  from = "/api/admin"
+  to = "/.netlify/functions/admin"
   status = 200
 
 [[redirects]]
