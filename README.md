@@ -1,82 +1,118 @@
-[README.md](https://github.com/user-attachments/files/26755090/README.md)
-# Zynthari Gallery — Setup Guide
+[README.md](https://github.com/user-attachments/files/26839434/README.md)
+# Zynthari Gallery — Complete Setup Guide
 
-## What's in this folder
-- `public/index.html` — the full website frontend
-- `netlify/functions/` — the backend API (runs on Netlify serverless)
-- `netlify.toml` — tells Netlify how to build and route
-- `package.json` — installs node-fetch for the functions
+## Admin credentials
+Email:    admin@zynthari.art
+Password: Admin@1234
 
-## STEP 1 — Create your free database (JSONBin.io)
+---
 
-1. Go to https://jsonbin.io and click **Sign Up** (free, no credit card)
-2. After login, click **API Keys** in the top menu → copy your **Master Key**
-3. Click **Create Bin** → paste `[]` → Name it `zyn-users` → Save → copy the **Bin ID** from the URL
-4. Create another bin → paste `[]` → Name it `zyn-artworks` → Save → copy the Bin ID
-5. Create another bin → paste `[]` → Name it `zyn-transactions` → Save → copy the Bin ID
+## STEP 1 — Create free database at JSONBin.io (5 minutes)
 
-## STEP 2 — Seed the admin user
+1. Go to https://jsonbin.io → Sign Up (free, no credit card needed)
+2. After logging in, click "API Keys" in top menu
+3. Copy your **X-Master-Key** — you'll need it later
+4. Click "+ Create Bin"
+   - Paste: []
+   - Name: zyn-users
+   - Click Save
+   - Copy the Bin ID from the URL bar (looks like: 64abc123def456...)
+5. Create another bin:
+   - Paste: []
+   - Name: zyn-artworks
+   - Save → copy Bin ID
+6. Create another bin:
+   - Paste: []
+   - Name: zyn-transactions
+   - Save → copy Bin ID
 
-In JSONBin, click your `zyn-users` bin → Edit → paste this (replace the bin content):
-```json
+---
+
+## STEP 2 — Seed the admin account
+
+In JSONBin, open your zyn-users bin, click the Edit button, and replace [] with this exact JSON:
+
 [
   {
     "id": "admin-001",
     "name": "Gallery Admin",
     "email": "admin@zynthari.art",
-    "pwHash": "H4e5f1c2a",
+    "pwHash": "H61fe854d",
     "role": "admin",
     "token": "ZYN-ADMIN001",
     "paymentMethods": {},
     "created": "2025-01-01T00:00:00.000Z"
   }
 ]
-```
-**Admin login:** admin@zynthari.art / Admin@1234
+
+Click Save. Admin login: admin@zynthari.art / Admin@1234
+
+---
 
 ## STEP 3 — Push to GitHub
 
-1. Create a new GitHub repository (e.g. `zynthari-gallery`)
-2. Upload ALL files keeping the folder structure:
-   ```
-   netlify.toml
-   package.json
-   public/index.html
-   netlify/functions/db.js
-   netlify/functions/session.js
-   netlify/functions/login.js
-   netlify/functions/register.js
-   netlify/functions/artworks.js
-   netlify/functions/artwork-delete.js
-   netlify/functions/purchase.js
-   netlify/functions/dashboard.js
-   netlify/functions/admin.js
-   ```
+Create a new GitHub repo (e.g. zynthari-gallery), keep it Public.
+Upload ALL files keeping this exact folder structure:
+
+  netlify.toml
+  package.json
+  README.md
+  public/
+    index.html
+  netlify/
+    functions/
+      db.js
+      login.js
+      register.js
+      session.js
+      artworks.js
+      artwork-delete.js
+      purchase.js
+      dashboard.js
+      admin.js
+
+---
 
 ## STEP 4 — Deploy on Netlify
 
-1. Go to https://netlify.com → **Add new site** → **Import from Git**
-2. Connect GitHub, select your repo
-3. Build settings: leave blank (netlify.toml handles it)
-4. Click **Deploy site**
+1. Go to https://netlify.com
+2. Click "Add new site" → "Import an existing project" → "Deploy with GitHub"
+3. Connect your GitHub account and select the repo
+4. Leave build settings blank (netlify.toml handles everything)
+5. Click "Deploy site"
 
-## STEP 5 — Add environment variables (CRITICAL)
+---
 
-In Netlify dashboard → **Site configuration** → **Environment variables** → Add these:
+## STEP 5 — Add environment variables (CRITICAL — site won't work without these)
 
-| Key | Value |
-|-----|-------|
-| `JSONBIN_MASTER_KEY` | your Master Key from Step 1 |
-| `JSONBIN_USERS_BIN` | your zyn-users Bin ID |
-| `JSONBIN_ARTWORKS_BIN` | your zyn-artworks Bin ID |
-| `JSONBIN_TRANSACTIONS_BIN` | your zyn-transactions Bin ID |
-| `SESSION_SECRET` | any long random string e.g. `zynthari-super-secret-key-2025-xkq` |
+In Netlify dashboard:
+→ Site configuration → Environment variables → Add variable
 
-Then go to **Deploys** → **Trigger deploy** → **Deploy site**
+Add ALL FIVE of these:
 
-## Done! Your site is live.
+  Key: JSONBIN_MASTER_KEY      Value: (your master key from Step 1)
+  Key: JSONBIN_USERS_BIN       Value: (your zyn-users bin ID)
+  Key: JSONBIN_ARTWORKS_BIN    Value: (your zyn-artworks bin ID)
+  Key: JSONBIN_TRANSACTIONS_BIN  Value: (your zyn-transactions bin ID)
+  Key: SESSION_SECRET          Value: zynthari-super-secret-key-2025-xyz
 
-- Users can register and their accounts persist forever
-- Artists can upload artwork and it stays until they delete it
-- Buyers can purchase and see their collection
-- Admin: admin@zynthari.art / Admin@1234
+After adding all 5 vars:
+→ Go to Deploys → Trigger deploy → Deploy site
+
+---
+
+## Done! Everything works:
+
+- Users can register → accounts saved to database permanently
+- Artists can upload artwork → stays in database until deleted
+- Admin panel: admin@zynthari.art / Admin@1234
+- Buyer/Seller dashboards load real data
+- Payment methods save to database
+
+## To get more traffic to your site:
+
+1. Share the URL on WhatsApp, Instagram, Twitter, TikTok
+2. Post in art Facebook groups
+3. Message artists directly to list their work
+4. Post on Reddit: r/Art, r/DigitalArt, r/artbusiness
+5. Every artwork page has share buttons — encourage artists to use them
