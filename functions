@@ -1,47 +1,242 @@
-const { readBin, writeBin, ok, err, cors, getUserIdFromEvent } = require('./db');
+'use strict';
+const { readBin, writeBin, hashPw, ok, err, preflight, parseBody, getUserIdFromEvent } = require('./db');
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-  if (event.httpMethod !== 'DELETE') return err('Method not allowed', 405);
+  if (event.httpMethod === 'OPTIONS') return preflight();
 
   try {
     const userId = getUserIdFromEvent(event);
     if (!userId) return err('Authentication required', 401);
-
-    const artworkId = event.queryStringParameters && event.queryStringParameters.id;
-    if (!artworkId) return err('Artwork ID required', 400);
-
     const users = await readBin('users');
     const user = users.find(u => u.id === userId);
-    if (!user) return err('User not found', 404);
+    if (!user || user.role !== 'admin') return err('Admin access required', 403);
 
-    const artworks = await readBin('artworks');
-    const artwork = artworks.find(a => a.id === artworkId);
-    if (!artwork) return err('Artwork not found', 404);
+    if (event.httpMethod === 'GET') {
+      const artworks = await readBin('artworks');
+      const txns = await readBin('transactions');
+      return ok({
+        total_users: users.length,
+        total_artworks: artworks.length,
+        total_transactions: txns.length,
+        sellers: users.filter(u=>u.role==='seller').length,
+        buyers: users.filter(u=>u.role==='buyer').length,
+        users: users.map(u=>({id:u.id,name:u.name,email:u.email,role:u.role,created:u.created})),
+        artworks
+      });
+    }
 
-    if (artwork.seller_id !== userId && user.role !== 'admin') return err('Unauthorized', 403);
+    if (event.httpMethod === 'POST') {
+      const body = parseBody(event);
+      const action = body.action;
 
-    await writeBin('artworks', artworks.filter(a => a.id !== artworkId));
-    return ok({ success: true });
-  } catch (e) {
-    return err(e.message, 500);
+      if (action === 'delete-artwork') {
+        const artworks = await readBin('artworks');
+        await writeBin('artworks', artworks.filter(a=>a.id!==body.artworkId));
+        return ok({success:true});
+      }
+      if (action === 'delete-user') {
+        if (body.userId === 'admin-001' || body.userId === userId) return ok({success:false, error:'Cannot delete this account'});
+        await writeBin('users', users.filter(u=>u.id!==body.userId));
+        return ok({success:true});
+      }
+      if (action === 'change-password') {
+        const pw = body.password || '';
+        if (pw.length < 8) return ok({success:false, error:'Password must be 8+ chars'});
+        const ui = users.findIndex(u=>u.id===userId);
+        users[ui].pwHash = hashPw(pw);
+        await writeBin('users', users);
+        return ok({success:true});
+      }
+    }
+    return err('Unknown action', 400);
+  } catch(e) {
+    return err('Server error: '+e.message, 500);
   }
 };
 
-const { readBin, writeBin, uid, sanitize, ok, err, cors, getUserIdFromEvent } = require('./db');
+'use strict';
+const { readBin, writeBin, ok, err, preflight, getUserIdFromEvent } = require('./db');
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-  if (event.httpMethod !== 'POST') return err('Method not allowed', 405);
-
+  if (event.httpMethod === 'OPTIONS') return preflight();
+  if (event.httpMethod !== 'DELETE') return err('Method not allowed', 405);
   try {
     const userId = getUserIdFromEvent(event);
     if (!userId) return err('Authentication required', 401);
+    const artworkId = (event.queryStringParameters || {}).id;
+    if (!artworkId) return err('Artwork ID required');
+    const users = await readBin('users');
+    const user = users.find(u => u.id === userId);
+    if (!user) return err('User not found', 404);
+    const artworks = await readBin('artworks');
+    const artwork = artworks.find(a => a.id === artworkId);
+    if (!artwork) return err('Artwork not found', 404);
+    if (artwork.seller_id !== userId && user.role !== 'admin') return err('Unauthorized', 403);
+    await writeBin('artworks', artworks.filter(a => a.id !== artworkId));
+    return ok({success:true});
+  } catch(e) {
+    return err('Server error: '+e.message, 500);
+  }
+};
 
-    let body = {};
-    try { body = JSON.parse(event.body || '{}'); } catch { return err('Invalid JSON'); }
+'use strict';
+const { readBin, hashPw, sanitize, ok, err, preflight, parseBody, makeToken } = require('./db');
 
-    const { artworkId, method } = body;
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return preflight();
+  if (event.httpMethod !== 'POST') return err('Method not allowed', 405);
+  try {
+    const body = parseBody(event);
+    const email = sanitize(body.email || '').toLowerCase();
+    const password = body.password || '';
+    if (!email || !password) return ok({success:false, error:'Email and password required'});
+    const users = await readBin('users');
+    const hash = hashPw(password);
+    const user = users.find(u => u.email === email && u.pwHash === hash);
+    if (!user) return ok({success:false, error:'Invalid email or password'});
+    const sessionToken = makeToken(user.id);
+    return ok({
+      success: true,
+      sessionToken,
+      user: {id:user.id, name:user.name, email:user.email, role:user.role, token:user.token||'', paymentMethods:user.paymentMethods||{}}
+    });
+  } catch(e) {
+    console.error('login error:', e.message);
+    return err('Server error: '+e.message, 500);
+  }
+};
+
+'use strict';
+const fetch = require('node-fetch');
+const MASTER_KEY = process.env.JSONBIN_MASTER_KEY;
+const BASE = 'https://api.jsonbin.io/v3/b';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'zynthari-2025-secret';
+const BINS = {
+  users: process.env.JSONBIN_USERS_BIN,
+  artworks: process.env.JSONBIN_ARTWORKS_BIN,
+  transactions: process.env.JSONBIN_TRANSACTIONS_BIN,
+};
+
+async function readBin(name) {
+  if (!MASTER_KEY || !BINS[name]) throw new Error('Missing env: '+name);
+  const res = await fetch(`${BASE}/${BINS[name]}/latest`, {
+    headers: { 'X-Master-Key': MASTER_KEY, 'X-Bin-Meta': 'false' }
+  });
+  if (!res.ok) throw new Error('readBin '+name+' failed '+res.status);
+  const data = await res.json();
+  if (data && data.record) return data.record;
+  return Array.isArray(data) ? data : [];
+}
+
+async function writeBin(name, data) {
+  if (!MASTER_KEY || !BINS[name]) throw new Error('Missing env: '+name);
+  const res = await fetch(`${BASE}/${BINS[name]}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Master-Key': MASTER_KEY, 'X-Bin-Versioning': 'false' },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error('writeBin '+name+' failed '+res.status);
+  return true;
+}
+
+function uid() { return 'z'+Math.random().toString(36).slice(2,10)+Date.now().toString(36); }
+function genToken() { return 'ZYN-'+Math.random().toString(36).slice(2,9).toUpperCase(); }
+
+function hashPw(pw) {
+  let h = 0;
+  for (let i = 0; i < pw.length; i++) { h = ((h << 5) - h) + pw.charCodeAt(i); h |= 0; }
+  return 'H' + Math.abs(h).toString(16);
+}
+
+function sanitize(s) {
+  if (!s) return '';
+  return String(s).replace(/<[^>]+>/g,'').replace(/javascript:/gi,'').trim().slice(0,2000);
+}
+
+function simpleSign(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) { h = ((h << 5) + h) ^ str.charCodeAt(i); h |= 0; }
+  return Math.abs(h).toString(36);
+}
+
+function makeToken(userId) {
+  const ts = Date.now();
+  const raw = userId + ':' + ts;
+  const sig = simpleSign(raw + SESSION_SECRET);
+  return Buffer.from(JSON.stringify({raw, sig})).toString('base64');
+}
+
+function verifyToken(token) {
+  try {
+    const obj = JSON.parse(Buffer.from(token, 'base64').toString());
+    if (!obj || !obj.raw || !obj.sig) return null;
+    if (simpleSign(obj.raw + SESSION_SECRET) !== obj.sig) return null;
+    const parts = obj.raw.split(':');
+    const ts = parseInt(parts[parts.length - 1]);
+    if (Date.now() - ts > 30 * 24 * 60 * 60 * 1000) return null;
+    return parts.slice(0, -1).join(':');
+  } catch { return null; }
+}
+
+function getUserIdFromEvent(event) {
+  const auth = (event.headers['authorization'] || event.headers['Authorization'] || '').trim();
+  if (!auth.startsWith('Bearer ')) return null;
+  return verifyToken(auth.slice(7));
+}
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Content-Type': 'application/json',
+};
+
+function ok(data, code=200) { return {statusCode: code, headers: CORS, body: JSON.stringify(data)}; }
+function err(msg, code=400) { return {statusCode: code, headers: CORS, body: JSON.stringify({success:false, error:msg})}; }
+function preflight() { return {statusCode:204, headers:CORS, body:''}; }
+
+function parseBody(event) {
+  const ct = (event.headers['content-type'] || '').toLowerCase();
+  const raw = event.body || '';
+  if (!raw) return {};
+  if (ct.includes('json')) { try { return JSON.parse(raw); } catch { return {}; } }
+  if (ct.includes('urlencoded')) {
+    const p = new URLSearchParams(raw);
+    const o = {}; for (const [k,v] of p.entries()) o[k]=v; return o;
+  }
+  try { return JSON.parse(raw); } catch { return {}; }
+}
+
+module.exports = { readBin, writeBin, uid, genToken, hashPw, sanitize, makeToken, verifyToken, getUserIdFromEvent, ok, err, preflight, parseBody, CORS };
+
+'use strict';
+const { readBin, ok, err, preflight, getUserIdFromEvent } = require('./db');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return preflight();
+  try {
+    const userId = getUserIdFromEvent(event);
+    if (!userId) return ok({logged_in:false});
+    const users = await readBin('users');
+    const user = users.find(u => u.id === userId);
+    if (!user) return ok({logged_in:false});
+    return ok({logged_in:true, user:{id:user.id, name:user.name, email:user.email, role:user.role, token:user.token||'', paymentMethods:user.paymentMethods||{}}});
+  } catch(e) {
+    return ok({logged_in:false});
+  }
+};
+
+'use strict';
+const { readBin, writeBin, uid, ok, err, preflight, parseBody, getUserIdFromEvent } = require('./db');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return preflight();
+  if (event.httpMethod !== 'POST') return err('Method not allowed', 405);
+  try {
+    const userId = getUserIdFromEvent(event);
+    if (!userId) return err('Authentication required', 401);
+    const body = parseBody(event);
+    const {artworkId, method} = body;
     if (!artworkId) return err('Artwork ID required');
 
     const users = await readBin('users');
@@ -50,254 +245,61 @@ exports.handler = async (event) => {
 
     const pm = buyer.paymentMethods || {};
     const hasPM = pm.card_last_four || pm.paypal_email || pm.payoneer_email || pm.bank_account;
-    if (!hasPM) return ok({ success: false, error: 'Please add a payment method first' });
+    if (!hasPM) return ok({success:false, error:'Please add a payment method first'});
 
     const artworks = await readBin('artworks');
-    const artwork = artworks.find(a => a.id === artworkId);
-    if (!artwork) return err('Artwork not found', 404);
-    if (artwork.seller_id === userId) return ok({ success: false, error: 'You cannot buy your own artwork' });
+    const idx = artworks.findIndex(a => a.id === artworkId);
+    if (idx < 0) return err('Artwork not found', 404);
+    const artwork = artworks[idx];
+    if (artwork.seller_id === userId) return ok({success:false, error:'You cannot buy your own artwork'});
 
     const now = new Date().toISOString();
-    const platformFee = artwork.price * 0.30;
-    const artistEarnings = artwork.price * 0.70;
-
-    // Record transaction
-    const txns = await readBin('transactions');
     const tx = {
       id: uid(), artwork_id: artworkId, artwork_title: artwork.title,
       seller_id: artwork.seller_id, artist_name: artwork.artist_name,
       buyer_id: userId, buyer_name: buyer.name,
-      amount: artwork.price, method: method || 'card',
-      platform_fee: platformFee, seller_earnings: artistEarnings,
-      artist_earnings: artistEarnings,
-      token: artwork.token, created_at: now, type: 'sale'
+      amount: artwork.price, method: method||'card',
+      platform_fee: artwork.price * 0.30,
+      seller_earnings: artwork.price * 0.70,
+      token: artwork.token, created_at: now, type:'sale'
     };
+
+    const txns = await readBin('transactions');
     txns.push(tx);
     await writeBin('transactions', txns);
 
     // Update provenance
-    const idx = artworks.findIndex(a => a.id === artworkId);
-    if (idx >= 0 && artworks[idx].provenance) {
-      artworks[idx].resale_count = (artworks[idx].resale_count || 0) + 1;
-      artworks[idx].provenance.resale_count = (artworks[idx].provenance.resale_count || 0) + 1;
-      artworks[idx].provenance.ownership_history.push({
-        type: 'sale', to_name: buyer.name, to_id: userId, price: artwork.price, date: now
-      });
-      await writeBin('artworks', artworks);
+    artworks[idx].resale_count = (artworks[idx].resale_count||0) + 1;
+    if (artworks[idx].provenance) {
+      artworks[idx].provenance.resale_count = (artworks[idx].provenance.resale_count||0) + 1;
+      artworks[idx].provenance.ownership_history.push({type:'sale', to_name:buyer.name, to_id:userId, price:artwork.price, date:now});
     }
+    await writeBin('artworks', artworks);
 
-    return ok({ success: true, transaction: tx });
-  } catch (e) {
-    return err(e.message, 500);
+    return ok({success:true, transaction:tx});
+  } catch(e) {
+    return err('Server error: '+e.message, 500);
   }
 };
 
-const { readBin, writeBin, sanitize, ok, err, cors, getUserIdFromEvent } = require('./db');
+'use strict';
+const { readBin, writeBin, uid, genToken, sanitize, ok, err, preflight, parseBody, getUserIdFromEvent } = require('./db');
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
+  if (event.httpMethod === 'OPTIONS') return preflight();
 
-  const userId = getUserIdFromEvent(event);
-  if (!userId) return err('Authentication required', 401);
-
-  const path = event.path.replace(/^\/api\//, '').replace(/^\.netlify\/functions\//, '');
-
-  try {
-    const users = await readBin('users');
-    const user = users.find(u => u.id === userId);
-    if (!user) return err('User not found', 404);
-
-    // GET buyer dashboard
-    if (event.httpMethod === 'GET' && path.includes('buyer-dashboard')) {
-      if (user.role !== 'buyer' && user.role !== 'admin') return err('Buyer access required', 403);
-      const txns = await readBin('transactions');
-      const purchases = txns.filter(t => t.buyer_id === userId);
-      const totalSpent = purchases.reduce((s, t) => s + t.amount, 0);
-      return ok({
-        name: user.name, purchases_count: purchases.length,
-        total_spent: totalSpent, current_value: totalSpent * 1.1,
-        purchases: purchases.map(t => ({
-          title: t.artwork_title, artist_name: t.artist_name,
-          purchase_price: t.amount, current_value: t.amount * 1.1,
-          token: t.token, date: t.created_at
-        })),
-        payment_methods: user.paymentMethods || {}
-      });
-    }
-
-    // GET seller dashboard
-    if (event.httpMethod === 'GET' && path.includes('seller-dashboard')) {
-      if (!['seller', 'admin'].includes(user.role)) return err('Seller access required', 403);
-      const artworks = await readBin('artworks');
-      const txns = await readBin('transactions');
-      const myWorks = artworks.filter(a => a.seller_id === userId);
-      const mySales = txns.filter(t => t.seller_id === userId);
-      const totalRev = mySales.reduce((s, t) => s + (t.seller_earnings || 0), 0);
-      const totalRoy = txns.filter(t => t.type === 'resale_royalty' && t.artist_id === userId).reduce((s, t) => s + (t.royalty_amount || 0), 0);
-      return ok({
-        name: user.name, token: user.token || '',
-        artworks_count: myWorks.length, sales_count: mySales.length,
-        total_revenue: totalRev, total_royalties: totalRoy,
-        artworks: myWorks, sales: mySales.map(t => ({
-          date: t.created_at, artwork_title: t.artwork_title,
-          type: 'sale', amount: t.amount, earnings: t.seller_earnings || 0
-        })),
-        payment_methods: user.paymentMethods || {}
-      });
-    }
-
-    // POST update payment methods (buyer or seller)
-    if (event.httpMethod === 'POST' && path.includes('payment')) {
-      let body = {};
-      try { body = JSON.parse(event.body || '{}'); } catch {}
-      const pm = user.paymentMethods || {};
-
-      if (body.method === 'card') {
-        pm.card_last_four = sanitize(body.card_last_four || '').slice(0, 4);
-        pm.card_name = sanitize(body.card_name || '');
-      } else if (body.method === 'paypal') {
-        pm.paypal_email = sanitize(body.paypal_email || '');
-      } else if (body.method === 'payoneer') {
-        pm.payoneer_email = sanitize(body.payoneer_email || '');
-        pm.payoneer_name = sanitize(body.payoneer_name || '');
-      } else if (body.method === 'bank') {
-        pm.bank_name = sanitize(body.bank_name || '');
-        pm.bank_holder = sanitize(body.bank_holder || '');
-        pm.bank_account = sanitize(body.bank_account || '');
-        pm.bank_routing = sanitize(body.bank_routing || '');
-        pm.bank_swift = sanitize(body.bank_swift || '');
-      }
-      // seller payout fields
-      if (body.paypal_email) pm.paypal_email = sanitize(body.paypal_email);
-      if (body.payoneer_email) pm.payoneer_email = sanitize(body.payoneer_email);
-      if (body.bank_name) pm.bank_name = sanitize(body.bank_name);
-
-      if (body.billing_address) pm.billing_address = sanitize(body.billing_address);
-
-      const userIdx = users.findIndex(u => u.id === userId);
-      users[userIdx].paymentMethods = pm;
-      await writeBin('users', users);
-      return ok({ success: true });
-    }
-
-    return err('Not found', 404);
-  } catch (e) {
-    return err(e.message, 500);
-  }
-};
-
-const { readBin, hashPw, sanitize, ok, err, cors, makeSessionToken } = require('./db');
-
-exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-  if (event.httpMethod !== 'POST') return err('Method not allowed', 405);
-
-  try {
-    let body = {};
-    try { body = JSON.parse(event.body || '{}'); } catch { body = {}; }
-    if (!body.email && event.body && event.body.includes('email=')) {
-      const p = new URLSearchParams(event.body);
-      body = { email: p.get('email'), password: p.get('password') };
-    }
-
-    const email = sanitize(body.email || '').toLowerCase();
-    const password = body.password || '';
-    if (!email || !password) return ok({ success: false, error: 'Email and password required' });
-
-    const users = await readBin('users');
-    const user = users.find(u => u.email === email && u.pwHash === hashPw(password));
-    if (!user) return ok({ success: false, error: 'Invalid email or password' });
-
-    const sessionToken = makeSessionToken(user.id);
-    return ok({
-      success: true,
-      sessionToken,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, token: user.token || '' }
-    });
-  } catch (e) {
-    return err(e.message, 500);
-  }
-};
-
-const { readBin, writeBin, hashPw, sanitize, ok, err, cors, getUserIdFromEvent } = require('./db');
-
-exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-
-  try {
-    const userId = getUserIdFromEvent(event);
-    if (!userId) return err('Authentication required', 401);
-
-    const users = await readBin('users');
-    const user = users.find(u => u.id === userId);
-    if (!user || user.role !== 'admin') return err('Admin access required', 403);
-
-    let body = {};
-    try { body = JSON.parse(event.body || '{}'); } catch {}
-
-    const action = (event.queryStringParameters && event.queryStringParameters.action) || body.action;
-
-    // GET stats
-    if (event.httpMethod === 'GET') {
-      const artworks = await readBin('artworks');
-      const txns = await readBin('transactions');
-      return ok({
-        total_users: users.length,
-        total_artworks: artworks.length,
-        total_transactions: txns.length,
-        sellers: users.filter(u => u.role === 'seller').length,
-        buyers: users.filter(u => u.role === 'buyer').length,
-        users: users.map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role, created: u.created })),
-        artworks
-      });
-    }
-
-    if (event.httpMethod === 'POST') {
-      // Delete artwork
-      if (action === 'delete-artwork') {
-        const artworks = await readBin('artworks');
-        await writeBin('artworks', artworks.filter(a => a.id !== body.artworkId));
-        return ok({ success: true });
-      }
-      // Delete user
-      if (action === 'delete-user') {
-        if (body.userId === 'admin-001') return ok({ success: false, error: 'Cannot delete main admin' });
-        await writeBin('users', users.filter(u => u.id !== body.userId));
-        return ok({ success: true });
-      }
-      // Change password
-      if (action === 'change-password') {
-        const pw = body.password || '';
-        if (pw.length < 8) return ok({ success: false, error: 'Password must be 8+ chars' });
-        const ui = users.findIndex(u => u.id === userId);
-        users[ui].pwHash = hashPw(pw);
-        await writeBin('users', users);
-        return ok({ success: true });
-      }
-    }
-
-    return err('Unknown action', 400);
-  } catch (e) {
-    return err(e.message, 500);
-  }
-};
-
-const { readBin, writeBin, uid, sanitize, ok, err, cors, getUserIdFromEvent } = require('./db');
-
-exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-
-  // GET — list all artworks
+  // GET all artworks — public
   if (event.httpMethod === 'GET') {
     try {
       const artworks = await readBin('artworks');
-      return ok(artworks);
-    } catch (e) {
+      return ok(Array.isArray(artworks) ? artworks : []);
+    } catch(e) {
+      console.error('artworks GET error:', e.message);
       return ok([]);
     }
   }
 
-  // POST — add artwork (requires seller auth)
+  // POST new artwork — seller/admin only
   if (event.httpMethod === 'POST') {
     try {
       const userId = getUserIdFromEvent(event);
@@ -305,37 +307,33 @@ exports.handler = async (event) => {
 
       const users = await readBin('users');
       const user = users.find(u => u.id === userId);
-      if (!user || !['seller', 'admin'].includes(user.role)) return err('Seller account required', 403);
+      if (!user || !['seller','admin'].includes(user.role)) return err('Seller account required', 403);
 
-      let body = {};
-      try { body = JSON.parse(event.body || '{}'); } catch { return err('Invalid JSON'); }
-
+      const body = parseBody(event);
       const title = sanitize(body.title || '');
       const price = parseFloat(body.price) || 0;
       const medium = sanitize(body.medium || 'Original Art');
       const description = sanitize(body.description || '');
-      const imageDataUrl = body.imageDataUrl || ''; // base64 image from frontend
+      const imageDataUrl = body.imageDataUrl || '';
 
-      if (!title) return ok({ success: false, error: 'Title required' });
-      if (price <= 0) return ok({ success: false, error: 'Valid price required' });
-      if (!imageDataUrl) return ok({ success: false, error: 'Image required' });
+      if (!title) return ok({success:false, error:'Title is required'});
+      if (price <= 0) return ok({success:false, error:'Valid price is required'});
+      if (!imageDataUrl || !imageDataUrl.startsWith('data:image')) return ok({success:false, error:'Valid image is required'});
 
       const artworkId = uid();
-      const token = user.token || ('ZYN-' + Math.random().toString(36).slice(2, 9).toUpperCase());
+      const tok = user.token || genToken();
       const now = new Date().toISOString();
 
       const artwork = {
         id: artworkId, title, medium, description, price,
-        image_url: imageDataUrl, // stored as base64
-        seller_id: userId,
-        artist_name: user.name,
-        token, verified: true, status: 'active',
-        created_at: now,
-        resale_count: 0,
+        image_url: imageDataUrl,
+        seller_id: userId, artist_name: user.name,
+        token: tok, verified: true, status: 'active',
+        created_at: now, resale_count: 0,
         provenance: {
-          token, artist_name: user.name, artist_id: userId,
+          token: tok, artist_name: user.name, artist_id: userId,
           created_at: now, resale_count: 0, original_price: price,
-          ownership_history: [{ type: 'creation', to_name: user.name, to_id: userId, price, date: now }]
+          ownership_history: [{type:'creation', to_name:user.name, to_id:userId, price, date:now}]
         }
       };
 
@@ -343,165 +341,95 @@ exports.handler = async (event) => {
       artworks.push(artwork);
       await writeBin('artworks', artworks);
 
-      return ok({ success: true, artwork, provenance: { token, certificate_id: 'COA-' + artworkId.slice(0, 8).toUpperCase() } });
-    } catch (e) {
-      return err(e.message, 500);
+      return ok({success:true, artwork, provenance:{token:tok, certificate_id:'COA-'+artworkId.slice(0,8).toUpperCase()}});
+    } catch(e) {
+      console.error('artworks POST error:', e.message);
+      return err('Server error: '+e.message, 500);
     }
   }
 
   return err('Method not allowed', 405);
 };
 
-const { readBin, writeBin, uid, genToken, hashPw, sanitize, ok, err, cors, makeSessionToken } = require('./db');
+'use strict';
+const { readBin, writeBin, sanitize, ok, err, preflight, parseBody, getUserIdFromEvent } = require('./db');
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return cors({ statusCode: 200, body: '' });
-  if (event.httpMethod !== 'POST') return err('Method not allowed', 405);
+  if (event.httpMethod === 'OPTIONS') return preflight();
+
+  const userId = getUserIdFromEvent(event);
+  if (!userId) return err('Authentication required', 401);
+
+  const type = (event.queryStringParameters||{}).type || '';
 
   try {
-    let body = {};
-    try { body = JSON.parse(event.body || '{}'); } catch { body = {}; }
+    const users = await readBin('users');
+    const userIdx = users.findIndex(u => u.id === userId);
+    if (userIdx < 0) return err('User not found', 404);
+    const user = users[userIdx];
 
-    // Also handle form data
-    if (!body.email && event.body && event.body.includes('email=')) {
-      const params = new URLSearchParams(event.body);
-      body = { name: params.get('name'), email: params.get('email'), password: params.get('password'), role: params.get('role'), social_url: params.get('social_url') };
+    // GET buyer dashboard
+    if (event.httpMethod === 'GET' && type === 'buyer-dashboard') {
+      const txns = await readBin('transactions');
+      const purchases = txns.filter(t => t.buyer_id === userId);
+      const totalSpent = purchases.reduce((s,t) => s + (t.amount||0), 0);
+      return ok({
+        name: user.name,
+        purchases_count: purchases.length,
+        total_spent: totalSpent,
+        current_value: totalSpent * 1.1,
+        purchases: purchases.map(t => ({
+          title: t.artwork_title, artist_name: t.artist_name,
+          purchase_price: t.amount, current_value: t.amount * 1.1,
+          token: t.token||'', date: t.created_at
+        })),
+        payment_methods: user.paymentMethods || {}
+      });
     }
 
-    const name = sanitize(body.name || '');
-    const email = sanitize(body.email || '').toLowerCase();
-    const password = body.password || '';
-    const role = ['buyer', 'seller'].includes(body.role) ? body.role : 'buyer';
+    // GET seller dashboard
+    if (event.httpMethod === 'GET' && type === 'seller-dashboard') {
+      if (!['seller','admin'].includes(user.role)) return err('Seller access required', 403);
+      const artworks = await readBin('artworks');
+      const txns = await readBin('transactions');
+      const myWorks = artworks.filter(a => a.seller_id === userId);
+      const mySales = txns.filter(t => t.seller_id === userId);
+      const totalRev = mySales.reduce((s,t) => s+(t.seller_earnings||0), 0);
+      return ok({
+        name: user.name, token: user.token||'',
+        artworks_count: myWorks.length, sales_count: mySales.length,
+        total_revenue: totalRev, total_royalties: totalRev * 0.05,
+        artworks: myWorks,
+        sales: mySales.map(t => ({
+          date: t.created_at, artwork_title: t.artwork_title,
+          type:'sale', amount: t.amount, earnings: t.seller_earnings||0
+        })),
+        payment_methods: user.paymentMethods || {}
+      });
+    }
 
-    if (!name || !email || !password) return ok({ success: false, error: 'All fields required' });
-    if (!/^[^@]+@[^@]+\.[^@]+$/.test(email)) return ok({ success: false, error: 'Invalid email address' });
-    if (password.length < 8) return ok({ success: false, error: 'Password must be 8+ characters' });
+    // POST update payment methods
+    if (event.httpMethod === 'POST' && type === 'payment') {
+      const body = parseBody(event);
+      const pm = user.paymentMethods || {};
+      const m = body.method || '';
+      if (m === 'card') { pm.card_last_four=sanitize(body.card_last_four||'').slice(0,4); pm.card_name=sanitize(body.card_name||''); }
+      else if (m === 'paypal') { pm.paypal_email=sanitize(body.paypal_email||''); }
+      else if (m === 'payoneer') { pm.payoneer_email=sanitize(body.payoneer_email||''); pm.payoneer_name=sanitize(body.payoneer_name||''); }
+      else if (m === 'bank') { pm.bank_name=sanitize(body.bank_name||''); pm.bank_holder=sanitize(body.bank_holder||''); pm.bank_account=sanitize(body.bank_account||''); pm.bank_routing=sanitize(body.bank_routing||''); pm.bank_swift=sanitize(body.bank_swift||''); }
+      // seller payout fields (no method key)
+      if (body.paypal_email && !m) pm.paypal_email=sanitize(body.paypal_email);
+      if (body.payoneer_email && !m) { pm.payoneer_email=sanitize(body.payoneer_email); pm.payoneer_name=sanitize(body.payoneer_name||''); }
+      if (body.bank_name && !m) { pm.bank_name=sanitize(body.bank_name); pm.bank_holder=sanitize(body.bank_holder||''); pm.bank_account=sanitize(body.bank_account||''); pm.bank_routing=sanitize(body.bank_routing||''); pm.bank_swift=sanitize(body.bank_swift||''); }
+      if (body.billing_address) pm.billing_address=sanitize(body.billing_address);
+      users[userIdx].paymentMethods = pm;
+      await writeBin('users', users);
+      return ok({success:true});
+    }
 
-    const users = await readBin('users');
-    if (users.find(u => u.email === email)) return ok({ success: false, error: 'Email already registered' });
-
-    const newUser = {
-      id: uid(), name, email,
-      pwHash: hashPw(password),
-      role, created: new Date().toISOString(),
-      paymentMethods: {},
-      ...(role === 'seller' ? { token: genToken() } : {})
-    };
-
-    users.push(newUser);
-    await writeBin('users', users);
-
-    const sessionToken = makeSessionToken(newUser.id);
-    return ok({
-      success: true,
-      sessionToken,
-      user: { id: newUser.id, name: newUser.name, email: newUser.email, role: newUser.role, token: newUser.token || '' }
-    });
-  } catch (e) {
-    return err(e.message, 500);
+    return err('Unknown request', 400);
+  } catch(e) {
+    console.error('dashboard error:', e.message);
+    return err('Server error: '+e.message, 500);
   }
 };
-
-// db.js — shared database layer using JSONBin.io (free persistent storage)
-// JSONBin stores JSON data permanently. Each "bin" is like a table.
-// Sign up free at jsonbin.io, create 3 bins (users, artworks, transactions), get your API key.
-
-const fetch = require('node-fetch');
-
-const MASTER_KEY = process.env.JSONBIN_MASTER_KEY; // set in Netlify env vars
-const BASE = 'https://api.jsonbin.io/v3/b';
-
-const BINS = {
-  users:        process.env.JSONBIN_USERS_BIN,
-  artworks:     process.env.JSONBIN_ARTWORKS_BIN,
-  transactions: process.env.JSONBIN_TRANSACTIONS_BIN,
-};
-
-async function readBin(name) {
-  const res = await fetch(`${BASE}/${BINS[name]}/latest`, {
-    headers: { 'X-Master-Key': MASTER_KEY, 'X-Bin-Meta': 'false' }
-  });
-  if (!res.ok) throw new Error(`readBin ${name} failed: ${res.status}`);
-  return res.json();
-}
-
-async function writeBin(name, data) {
-  const res = await fetch(`${BASE}/${BINS[name]}`, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Master-Key': MASTER_KEY,
-      'X-Bin-Meta': 'false'
-    },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) throw new Error(`writeBin ${name} failed: ${res.status}`);
-  return res.json();
-}
-
-function uid() {
-  return 'z' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
-
-function genToken() {
-  return 'ZYN-' + Math.random().toString(36).slice(2, 9).toUpperCase();
-}
-
-function hashPw(pw) {
-  // Simple deterministic hash — same as frontend
-  let h = 0;
-  for (let i = 0; i < pw.length; i++) { h = ((h << 5) - h) + pw.charCodeAt(i); h |= 0; }
-  return 'H' + Math.abs(h).toString(16);
-}
-
-function sanitize(s) {
-  if (!s) return '';
-  return String(s).replace(/<[^>]+>/g, '').replace(/javascript:/gi, '').trim().slice(0, 1000);
-}
-
-function cors(res) {
-  return {
-    ...res,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Content-Type': 'application/json',
-      ...(res.headers || {})
-    }
-  };
-}
-
-function ok(data, code = 200) {
-  return cors({ statusCode: code, body: JSON.stringify(data) });
-}
-
-function err(msg, code = 400) {
-  return cors({ statusCode: code, body: JSON.stringify({ error: msg, success: false }) });
-}
-
-// Simple session: we sign a token with a secret
-const SESSION_SECRET = process.env.SESSION_SECRET || 'zynthari-secret-2025';
-
-function makeSessionToken(userId) {
-  const payload = `${userId}:${Date.now()}`;
-  const sig = hashPw(payload + SESSION_SECRET);
-  return Buffer.from(JSON.stringify({ payload, sig })).toString('base64');
-}
-
-function verifySessionToken(token) {
-  try {
-    const { payload, sig } = JSON.parse(Buffer.from(token, 'base64').toString());
-    if (hashPw(payload + SESSION_SECRET) !== sig) return null;
-    const [userId] = payload.split(':');
-    return userId;
-  } catch { return null; }
-}
-
-function getUserIdFromEvent(event) {
-  const auth = event.headers['authorization'] || event.headers['Authorization'] || '';
-  if (!auth.startsWith('Bearer ')) return null;
-  return verifySessionToken(auth.slice(7));
-}
-
-module.exports = { readBin, writeBin, uid, genToken, hashPw, sanitize, ok, err, cors, makeSessionToken, verifySessionToken, getUserIdFromEvent };
